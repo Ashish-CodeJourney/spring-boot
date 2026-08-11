@@ -17,18 +17,31 @@
 package org.springframework.boot.context.properties;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.jspecify.annotations.Nullable;
 
 import org.springframework.aot.generate.GenerationContext;
+import org.springframework.aot.hint.MemberCategory;
+import org.springframework.aot.hint.RuntimeHints;
 import org.springframework.beans.factory.aot.BeanFactoryInitializationAotContribution;
 import org.springframework.beans.factory.aot.BeanFactoryInitializationAotProcessor;
 import org.springframework.beans.factory.aot.BeanFactoryInitializationCode;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.boot.context.properties.bind.BindContext;
+import org.springframework.boot.context.properties.bind.BindHandler;
 import org.springframework.boot.context.properties.bind.BindMethod;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.BindableRuntimeHintsRegistrar;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
+import org.springframework.core.env.Environment;
 import org.springframework.util.ClassUtils;
 
 /**
@@ -39,6 +52,7 @@ import org.springframework.util.ClassUtils;
  * @author Christoph Strobl
  * @author Sebastien Deleuze
  * @author Andy Wilkinson
+ * @author Ashish Vaghela
  */
 class ConfigurationPropertiesBeanFactoryInitializationAotProcessor implements BeanFactoryInitializationAotProcessor {
 
@@ -47,37 +61,107 @@ class ConfigurationPropertiesBeanFactoryInitializationAotProcessor implements Be
 			ConfigurableListableBeanFactory beanFactory) {
 		String[] beanNames = beanFactory.getBeanNamesForAnnotation(ConfigurationProperties.class);
 		List<Bindable<?>> bindables = new ArrayList<>();
+		Map<String, Bindable<?>> bindablesByPrefix = new LinkedHashMap<>();
 		for (String beanName : beanNames) {
 			Class<?> beanType = beanFactory.getType(beanName, false);
 			if (beanType != null) {
 				BindMethod bindMethod = beanFactory.containsBeanDefinition(beanName)
 						? (BindMethod) beanFactory.getBeanDefinition(beanName).getAttribute(BindMethod.class.getName())
 						: null;
-				bindables.add(Bindable.of(ClassUtils.getUserClass(beanType))
-					.withBindMethod((bindMethod != null) ? bindMethod : BindMethod.JAVA_BEAN));
+				Bindable<?> bindable = Bindable.of(ClassUtils.getUserClass(beanType))
+					.withBindMethod((bindMethod != null) ? bindMethod : BindMethod.JAVA_BEAN);
+				bindables.add(bindable);
+				bindablesByPrefix.put(getPrefix(beanFactory, beanName), bindable);
 			}
 		}
-		return (!bindables.isEmpty()) ? new ConfigurationPropertiesReflectionHintsContribution(bindables) : null;
+		if (bindables.isEmpty()) {
+			return null;
+		}
+		Environment environment = beanFactory.getBeanProvider(Environment.class).getIfAvailable();
+		return new ConfigurationPropertiesReflectionHintsContribution(bindables, bindablesByPrefix, environment);
+	}
+
+	private String getPrefix(ConfigurableListableBeanFactory beanFactory, String beanName) {
+		ConfigurationProperties annotation = beanFactory.findAnnotationOnBean(beanName, ConfigurationProperties.class);
+		return (annotation != null) ? annotation.prefix() : "";
 	}
 
 	static final class ConfigurationPropertiesReflectionHintsContribution
 			implements BeanFactoryInitializationAotContribution {
 
+		private static final Log logger = LogFactory.getLog(ConfigurationPropertiesReflectionHintsContribution.class);
+
 		private final List<Bindable<?>> bindables;
 
-		private ConfigurationPropertiesReflectionHintsContribution(List<Bindable<?>> bindables) {
+		private final Map<String, Bindable<?>> bindablesByPrefix;
+
+		private final @Nullable Environment environment;
+
+		private ConfigurationPropertiesReflectionHintsContribution(List<Bindable<?>> bindables,
+				Map<String, Bindable<?>> bindablesByPrefix, @Nullable Environment environment) {
 			this.bindables = bindables;
+			this.bindablesByPrefix = bindablesByPrefix;
+			this.environment = environment;
 		}
 
 		@Override
 		public void applyTo(GenerationContext generationContext,
 				BeanFactoryInitializationCode beanFactoryInitializationCode) {
-			BindableRuntimeHintsRegistrar.forBindables(this.bindables)
-				.registerHints(generationContext.getRuntimeHints());
+			RuntimeHints hints = generationContext.getRuntimeHints();
+			BindableRuntimeHintsRegistrar.forBindables(this.bindables).registerHints(hints);
+			registerConfiguredClassHints(hints);
+		}
+
+		/**
+		 * Register reflection hints for the values of any property of type {@link Class}.
+		 * Such values are typically instantiated reflectively by the component to which
+		 * they are given.
+		 * @param hints the hints to contribute to
+		 */
+		private void registerConfiguredClassHints(RuntimeHints hints) {
+			if (this.environment == null) {
+				return;
+			}
+			Binder binder = Binder.get(this.environment);
+			ClassValueBindHandler handler = new ClassValueBindHandler();
+			this.bindablesByPrefix.forEach((prefix, bindable) -> {
+				try {
+					binder.bind(prefix, bindable, handler);
+				}
+				catch (Exception ex) {
+					logger.debug("Skipping class value hints for '" + prefix + "'", ex);
+				}
+			});
+			for (Class<?> type : handler.getClassValues()) {
+				hints.reflection().registerType(type, MemberCategory.INVOKE_DECLARED_CONSTRUCTORS);
+			}
 		}
 
 		Iterable<Bindable<?>> getBindables() {
 			return this.bindables;
+		}
+
+	}
+
+	/**
+	 * {@link BindHandler} that collects the values of any bound property of type
+	 * {@link Class}.
+	 */
+	private static final class ClassValueBindHandler implements BindHandler {
+
+		private final Set<Class<?>> classValues = new LinkedHashSet<>();
+
+		@Override
+		public Object onSuccess(ConfigurationPropertyName name, Bindable<?> target, BindContext context,
+				Object result) {
+			if (result instanceof Class<?> classValue) {
+				this.classValues.add(classValue);
+			}
+			return result;
+		}
+
+		Set<Class<?>> getClassValues() {
+			return this.classValues;
 		}
 
 	}

@@ -16,6 +16,8 @@
 
 package org.springframework.boot.context.properties;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import org.assertj.core.api.AbstractAssert;
@@ -38,6 +40,8 @@ import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.mock.env.MockEnvironment;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -49,6 +53,7 @@ import static org.mockito.Mockito.mock;
  * @author Moritz Halbritter
  * @author Sebastien Deleuze
  * @author Andy Wilkinson
+ * @author Ashish Vaghela
  */
 class ConfigurationPropertiesBeanFactoryInitializationAotProcessorTests {
 
@@ -118,6 +123,37 @@ class ConfigurationPropertiesBeanFactoryInitializationAotProcessorTests {
 			.containsExactly(TypeReference.of(PossibleConstructorBindingProperties.class));
 	}
 
+	@Test
+	void classPropertyRegistersReflectionHintsForConfiguredValue() {
+		MockEnvironment environment = new MockEnvironment();
+		environment.setProperty("class-value.type", StringBuilder.class.getName());
+		ConfigurationPropertiesReflectionHintsContribution contribution = process(EnableClassValueProperties.class,
+				environment);
+		assertThat(contribution).isNotNull();
+		assertThat(typeHints(contribution).map(TypeHint::getType)).contains(TypeReference.of(StringBuilder.class));
+	}
+
+	@Test
+	void classPropertyInMapRegistersReflectionHintsForConfiguredValues() {
+		MockEnvironment environment = new MockEnvironment();
+		environment.setProperty("class-value.types.first", StringBuilder.class.getName());
+		environment.setProperty("class-value.types.second", StringBuffer.class.getName());
+		ConfigurationPropertiesReflectionHintsContribution contribution = process(EnableClassValueProperties.class,
+				environment);
+		assertThat(contribution).isNotNull();
+		assertThat(typeHints(contribution).map(TypeHint::getType)).contains(TypeReference.of(StringBuilder.class),
+				TypeReference.of(StringBuffer.class));
+	}
+
+	@Test
+	void classPropertyWithNoConfiguredValueRegistersNoAdditionalHints() {
+		ConfigurationPropertiesReflectionHintsContribution contribution = process(EnableClassValueProperties.class,
+				new MockEnvironment());
+		assertThat(contribution).isNotNull();
+		assertThat(typeHints(contribution).map(TypeHint::getType))
+			.containsExactly(TypeReference.of(ClassValueProperties.class));
+	}
+
 	private Stream<TypeHint> typeHints(ConfigurationPropertiesReflectionHintsContribution contribution) {
 		TestGenerationContext generationContext = new TestGenerationContext();
 		contribution.applyTo(generationContext, mock(BeanFactoryInitializationCode.class));
@@ -126,6 +162,16 @@ class ConfigurationPropertiesBeanFactoryInitializationAotProcessorTests {
 
 	private @Nullable ConfigurationPropertiesReflectionHintsContribution process(Class<?> config) {
 		try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(config)) {
+			return process(context.getBeanFactory());
+		}
+	}
+
+	private @Nullable ConfigurationPropertiesReflectionHintsContribution process(Class<?> config,
+			ConfigurableEnvironment environment) {
+		try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+			context.setEnvironment(environment);
+			context.register(config);
+			context.refresh();
 			return process(context.getBeanFactory());
 		}
 	}
@@ -216,6 +262,32 @@ class ConfigurationPropertiesBeanFactoryInitializationAotProcessorTests {
 
 		void setValue(@Nullable String value) {
 			this.value = value;
+		}
+
+	}
+
+	@EnableConfigurationProperties(ClassValueProperties.class)
+	static class EnableClassValueProperties {
+
+	}
+
+	@ConfigurationProperties("class-value")
+	static class ClassValueProperties {
+
+		private @Nullable Class<?> type;
+
+		private final Map<String, Class<?>> types = new LinkedHashMap<>();
+
+		@Nullable Class<?> getType() {
+			return this.type;
+		}
+
+		void setType(@Nullable Class<?> type) {
+			this.type = type;
+		}
+
+		Map<String, Class<?>> getTypes() {
+			return this.types;
 		}
 
 	}
